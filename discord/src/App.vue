@@ -35,9 +35,10 @@
           </div>
         </div>
       </div>
-      <div class="middle-panel">
-        <video id="localVideo" autoplay muted></video>
-        <video id="remoteVideo" autoplay></video>
+      <div class="middle-panel" v-if="currentChannelId">
+        <button @click="joinVideoChannel">화상 채팅 참여</button>
+        <video ref="localVideo" autoplay></video>
+        <video ref="remoteVideo" autoplay></video>
       </div>
       <div class="right-panel">
         <div class="message-input" v-if="currentChannelId">
@@ -65,7 +66,8 @@
       return {
         username: '',
         currentChannelId: null,
-        currentSubscriptionId: null,
+        textSubscriptionId: null,
+        videoSubscriptionId: null,
         content:'',
         userList: [],
         channelList: [],
@@ -75,7 +77,12 @@
         showApp: true,
         connectionErrorMessage: '',
         userLoadErrorMessage: '',
-        channelLoadErrorMessage: ''
+        channelLoadErrorMessage: '',
+        localStream: null,
+        remoteStream:  null,
+        peer: null,
+        offerSusbcriptionId: '',
+        answerSusbcriptionId: ''
       }; 
     },
     methods: {
@@ -117,9 +124,121 @@
             this.channelLoadErrorMessage = 'Failed to load channel list'
           });
       },
+      async setVideoStream() {
+        await navigator.mediaDevices
+        .getUserMedia({
+          video: true,
+          audio: true
+        })
+        .then((stream) => {
+          this.$refs.localVideo.srcObject = stream;
+          this.localStream = stream;
+        })
+      },
+      joinVideoChannel() {
+        this.setVideoStream().then(() => {
+          if (this.currentChannelId) {
+          const videoSubscription = this.stompClient.subscribe('/topic/channels/' + this.currentChannelId + '/video', res => {
+            const username = JSON.parse(res.body).username;
+            if (this.username !== username) {
+              console.log("========요청 받음========");
+              this.sendOffer(username);
+            }
+          });
+
+          const offerSubscription = this.stompClient.subscribe('/topic/offer/' + this.username, res => {
+            const response = JSON.parse(res.body);
+            console.log("========offer 받음========");
+            this.sendAnswer(response.sender);
+            this.handleSignal(response.signal);
+          });
+
+          const answerSubscription = this.stompClient.subscribe('/topic/answer/' + this.username, res => {
+            const response = JSON.parse(res.body);
+            console.log("========answer 받음========");
+            this.handleSignal(response.signal);
+          });
+
+          // 비디오 채널 입장
+          this.stompClient.send("/app/channels/" + this.currentChannelId + '/video/entrance', JSON.stringify({
+            username: this.username
+          }), {});
+
+          this.videoSubscriptionId = videoSubscription.id;
+          this.offerSusbcriptionId = offerSubscription.id;
+          this.answerSusbcriptionId = answerSubscription.id;
+        }
+        })
+      
+      },
+      sendOffer(username) {
+        this.peer = new Peer({
+          initiator: true,
+          trickle: false,
+          stream: this.localStream
+        });
+
+        this.peer.on("signal", (data) => {
+          this.stompClient.send('/app/offer', JSON.stringify({
+            sender: this.username,
+            receiver: username,
+            signal: data
+          }))
+          console.log("========offer 전송========");
+        });
+
+        this.peer.on("stream", (stream) => {
+          this.$refs.remoteVideo.srcObject = stream;
+          this.remoteStream = stream;
+
+          console.log("========stream 수신========");
+        });
+
+        this.peer.on("error", (err) => {
+          console.log("error", err);
+        });
+      },
+      sendAnswer(username) {
+        console.log("sendAnswer called for:", username);
+        console.log("Local stream:", this.localStream);
+        this.peer = new Peer({
+          initiator: false,
+          trickle: false,
+          stream: this.localStream
+        });
+
+        this.peer.on("signal", (data) => {
+          this.stompClient.send('/app/answer', JSON.stringify({
+            sender: this.username,
+            receiver: username,
+            signal: data
+          }))
+          console.log("========answer 전송========");
+        });
+
+        this.peer.on("stream", (stream) => {
+          this.$refs.remoteVideo.srcObject = stream;
+          this.remoteStream = stream;
+
+          console.log("========stream 수신========");
+        });
+
+        this.peer.on("error", (err) => {
+          console.log("error", err);
+        });
+      },
+      handleSignal(signalData) {
+        console.log("Handling signal data:", signalData);
+      try {
+        this.peer.signal(signalData);
+      } catch (err) {
+        console.error("Error signaling peer:", err);
+      }
+      },
       subscribeToChannel(channelId) {
         if (this.currentChannelId) {
-          this.stompClient.unsubscribe(this.currentSubscriptionId);
+          this.stompClient.unsubscribe(this.textSubscriptionId);
+          this.stompClient.unsubscribe(this.videoSubscriptionId);
           this.messageList = [];
         }
 
@@ -129,7 +248,7 @@
         });
 
         this.currentChannelId = channelId;
-        this.currentSubscriptionId = subscription.id;
+        this.textSubscriptionId = subscription.id;
       },
       connect() {
         const serverURL = "http://localhost:8080/ws";
