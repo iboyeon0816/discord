@@ -37,8 +37,12 @@
       </div>
       <div class="middle-panel" v-if="currentChannelId">
         <button @click="joinVideoChannel">화상 채팅 참여</button>
-        <video ref="localVideo" autoplay></video>
-        <video ref="remoteVideo" autoplay></video>
+        <div v-if="videoOn">
+          <button @click="handleCameraClick">카메라 끄기/켜기</button>
+          <button @click="leaveVideoChannel">화상 채팅 나가기</button>
+          <video ref="localVideo" autoplay></video>
+          <video ref="remoteVideo" autoplay></video>
+        </div>
       </div>
       <div class="right-panel">
         <div class="message-input" v-if="currentChannelId">
@@ -82,7 +86,8 @@
         remoteStream:  null,
         peer: null,
         offerSusbcriptionId: '',
-        answerSusbcriptionId: ''
+        answerSusbcriptionId: '',
+        videoOn: false
       }; 
     },
     methods: {
@@ -124,6 +129,11 @@
             this.channelLoadErrorMessage = 'Failed to load channel list'
           });
       },
+      handleCameraClick() {
+        this.localStream
+        .getVideoTracks()
+        .forEach((track) => track.enabled =! track.enabled);
+      },
       async setVideoStream() {
         await navigator.mediaDevices
         .getUserMedia({
@@ -133,9 +143,14 @@
         .then((stream) => {
           this.$refs.localVideo.srcObject = stream;
           this.localStream = stream;
+          this.localStream
+          .getVideoTracks()
+          .forEach((track) => track.enabled =! track.enabled);
         })
       },
       joinVideoChannel() {
+        this.videoOn = true;
+        
         this.setVideoStream().then(() => {
           if (this.currentChannelId) {
           const videoSubscription = this.stompClient.subscribe('/topic/channels/' + this.currentChannelId + '/video', res => {
@@ -169,12 +184,48 @@
           this.answerSusbcriptionId = answerSubscription.id;
         }
         })
-      
+      },
+      leaveVideoChannel() {
+        if (this.peer) {
+          this.peer.destroy();
+          this.peer = null;
+        }
+
+        if (this.localStream) {
+          this.localStream.getTracks().forEach(track => track.stop());
+          this.localStream = null;
+        }
+
+        if (this.remoteStream) {
+          this.remoteStream.getTracks().forEach(track => track.stop());
+          this.remoteStream = null;
+        }
+
+        if (this.videoSubscriptionId) {
+          this.stompClient.unsubscribe(this.videoSubscriptionId);
+          this.videoSubscriptionId = null;
+        }
+        if (this.offerSubscriptionId) {
+          this.stompClient.unsubscribe(this.offerSubscriptionId);
+          this.offerSubscriptionId = null;
+        }
+        if (this.answerSubscriptionId) {
+          this.stompClient.unsubscribe(this.answerSubscriptionId);
+          this.answerSubscriptionId = null;
+        }
+
+        if (this.$refs.localVideo) {
+         this.$refs.localVideo.srcObject = null;
+        }
+        if (this.$refs.remoteVideo) {
+          this.$refs.remoteVideo.srcObject = null;
+        }
+        this.videoOn = false;
       },
       sendOffer(username) {
         this.peer = new Peer({
           initiator: true,
-          trickle: false,
+          trickle: true,
           stream: this.localStream
         });
 
@@ -197,13 +248,18 @@
         this.peer.on("error", (err) => {
           console.log("error", err);
         });
+
+        this.peer.on("close", () => {
+          console.log("----------close--------");
+          this.peer = null;
+        });
       },
       sendAnswer(username) {
         console.log("sendAnswer called for:", username);
         console.log("Local stream:", this.localStream);
         this.peer = new Peer({
           initiator: false,
-          trickle: false,
+          trickle: true,
           stream: this.localStream
         });
 
@@ -225,6 +281,11 @@
 
         this.peer.on("error", (err) => {
           console.log("error", err);
+        });
+
+        this.peer.on("close", () => {
+          console.log("----------close--------");
+          this.peer = null;
         });
       },
       handleSignal(signalData) {
