@@ -15,7 +15,6 @@
             <h3>사용자 목록</h3>
             <button @click="refreshUsers">새로고침</button>
           </div>
-          <div v-if="userLoadErrorMessage" class="error">{{ userLoadErrorMessage }}</div>
           <div v-for="(username, idx) in userList" :key="idx" class="item">
             <h4>{{ username }}</h4>
           </div>
@@ -25,10 +24,9 @@
             <h3>채팅방 채널</h3>
             <button @click="refreshChannels">새로고침</button>
           </div>
-          <div v-if="channelLoadErrorMessage" class="error">{{ channelLoadErrorMessage }}</div>
           <div v-for="(channel, idx) in channelList" :key="idx" class="item">
             <h4>{{ channel.channelName }}</h4>
-            <button v-if="currentChannelId !== channel.channelId" @click="subscribeToChannel(channel.channelId)">
+            <button v-if="currentChannelId !== channel.channelId" @click="subscribeChannel(channel.channelId)">
               구독
             </button>
             <span v-else>입장 중</span>
@@ -36,10 +34,12 @@
         </div>
       </div>
       <div class="middle-panel" v-if="currentChannelId">
-        <button @click="joinVideoChannel">화상 채팅 참여</button>
-        <div v-if="videoOn">
-          <button @click="handleCameraClick">카메라 끄기/켜기</button>
+        <div v-if="!videoOn">
+          <button @click="joinVideoChannel">화상 채팅 참여</button>
+        </div>
+        <div v-else>
           <button @click="leaveVideoChannel">화상 채팅 나가기</button>
+          <button @click="handleCamera">카메라 ON/OFF</button>
           <video ref="localVideo" autoplay></video>
           <video ref="remoteVideo" autoplay></video>
         </div>
@@ -48,7 +48,7 @@
         <div class="message-input" v-if="currentChannelId">
             <input v-model="content" @keyup.enter="sendMessage" placeholder="메시지 입력" />
             <button @click="sendMessage">전송</button>
-          </div>
+        </div>
         <div class="message-list">
           <div v-for="(message, idx) in messageList" :key="idx" class="message-item">
             <p><strong>{{ message.username }}:</strong> {{ message.content }}</p>
@@ -59,7 +59,6 @@
 </template>
 
 <script>
-  import Peer from 'simple-peer';
   import Stomp from 'webstomp-client';
   import SockJS from 'sockjs-client';
   import axios from 'axios';
@@ -71,235 +70,212 @@
         username: '',
         currentChannelId: null,
         textSubscriptionId: null,
-        videoSubscriptionId: null,
         content:'',
         userList: [],
         channelList: [],
         messageList: [],
         stompClient: null,
-        connected: false,
         showApp: true,
         connectionErrorMessage: '',
-        userLoadErrorMessage: '',
-        channelLoadErrorMessage: '',
         localStream: null,
         remoteStream:  null,
-        peer: null,
-        offerSusbcriptionId: '',
-        answerSusbcriptionId: '',
-        videoOn: false
+        peerConnection: null,
+        videoSubscriptionId: null,
+        videoOn: false,
+        peername: null,
+        videoChannelSubscribeId: null,
+        offerSubscribeId : null,
+        answerSubscribeId: null,
+        candidateSubscribeId: null
       }; 
     },
     methods: {
-      sendMessage() {
-        if (this.content.trim() !== '') {
-          this.send();
-          this.content = "";
+      async joinVideoChannel() {
+        this.videoOn = true;
+        try {
+          this.localStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true
+          });
+
+          this.localStream.getVideoTracks().forEach((track) => {
+            track.enabled = false;
+          });
+
+          this.$refs.localVideo.srcObject = this.localStream;
+
+          const videoChannelSubscribe = this.stompClient.subscribe('/topic/channels/' + this.currentChannelId +'/video', this.handleRequest);
+          const offerSubscribe = this.stompClient.subscribe('/topic/offer/' + this.username, this.handleOffer);
+          const answerSubscribe = this.stompClient.subscribe('/topic/answer/' + this.username, this.handleAnswer);
+          const candidateSubscribe = this.stompClient.subscribe('/topic/candidate/' + this.username, this.handleCandidate);
+
+          this.videoChannelSubscribeId = videoChannelSubscribe.id;
+          this.offerSubscribeId = offerSubscribe.id;
+          this.answerSubscribeId = answerSubscribe.id;
+          this.candidateSubscribeId = candidateSubscribe.id;
+
+          this.peerConnection = new RTCPeerConnection();
+          this.localStream.getTracks().forEach(track => this.peerConnection.addTrack(track, this.localStream));
+
+          this.peerConnection.onicecandidate = event => {
+            if (event.candidate) {
+              this.stompClient.send('/app/candidate', JSON.stringify({
+                sender: this.username,
+                receiver: this.peername,
+                candidate: event.candidate
+              }), {});
+            }
+          };
+
+          this.peerConnection.ontrack = event => {
+            if (this.$refs.remoteVideo.srcObject !== event.streams[0]) {
+              this.$refs.remoteVideo.srcObject = event.streams[0];
+            }
+          };
+
+          this.stompClient.send('/app/channels/' + this.currentChannelId + '/video/conn', JSON.stringify({
+            username: this.username,
+            eventType: 'CONNECT'
+          }), {});
+        } catch (error) {
+          console.error('Error starting call', error);
         }
       },
-      send() {
-        if (this.stompClient && this.connected) {
-          const msg = {
-            username: this.username,
-            content: this.content
-          };
-          this.stompClient.send("/app/channels/" + this.currentChannelId + '/text/messages', JSON.stringify(msg), {});
+      async handleRequest(message) {
+        const peername = JSON.parse(message.body).username;
+        this.peername = peername;
+        if (peername !== this.username) {
+          if (JSON.parse(message.body).eventType === "CONNECT") {
+            const offer = await this.peerConnection.createOffer();
+            this.peerConnection.setLocalDescription(offer);
+            this.stompClient.send('/app/offer', JSON.stringify({
+              sender: this.username,
+              receiver: peername,
+              signal: offer
+            }), {});
+          }
+          else {
+            this.peername = null;
+
+          }
         }
+      },
+      async handleOffer(message) {
+        const offer = JSON.parse(message.body).signal;
+        this.peername = JSON.parse(message.body).sender;
+        this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await this.peerConnection.createAnswer();
+        this.peerConnection.setLocalDescription(answer);
+        this.stompClient.send('/app/answer', JSON.stringify({
+          sender: this.username,
+          receiver: JSON.parse(message.body).sender,
+          signal: answer
+        }), {});
+      },
+      async handleAnswer(message) {
+        const answer = JSON.parse(message.body).signal;
+        this.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+      },
+      async handleCandidate(message) {
+        const candidate = JSON.parse(message.body).candidate;
+        await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+      },
+      handleDisconnectedUser() {
+        this.peername = null;
+
+        if (this.peerConnection) {
+          this.peerConnection.close();
+          this.peerConnection = null;
+        }
+        if (this.remoteStream) {
+          this.remoteStream.getTracks().forEach(track => track.stop());
+          this.remoteStream = null;
+          this.$refs.remoteVideo.srcObject = null;
+        }
+      },
+      leaveVideoChannel() {
+        this.peername = null;
+
+        if (this.peerConnection) {
+          this.peerConnection.close();
+          this.peerConnection = null;
+        }
+        if (this.localStream) {
+          this.localStream.getTracks().forEach(track => track.stop());
+          this.localStream = null;
+          this.$refs.localVideo.srcObject = null;
+        }
+        if (this.remoteStream) {
+          this.remoteStream.getTracks().forEach(track => track.stop());
+          this.remoteStream = null;
+          this.$refs.remoteVideo.srcObject = null;
+        }
+
+        this.stompClient.unsubscribe(this.videoChannelSubscribeId);
+        this.stompClient.unsubscribe(this.offerSubscribeId);
+        this.stompClient.unsubscribe(this.answerSubscribeId);
+        this.stompClient.unsubscribe(this.candidateSubscribeId);
+
+        this.stompClient.send('/app/channels/' + this.currentChannelId + '/video/conn', JSON.stringify({
+            username: this.username,
+            eventType: 'DISCONNECT'
+          }), {});
+
+        this.videoOn = false;
+      },
+      handleCamera(){
+        this.localStream.getVideoTracks().forEach((track) => {
+          track.enabled = !track.enabled;
+        });
+      },
+      connect() {
+        const serverURL = "http://localhost:8080/ws";
+        let socket = new SockJS(serverURL);
+        this.stompClient = Stomp.over(socket);
+
+        this.stompClient.connect({ username: this.username }, 
+          () => {
+            this.showApp = false;
+            this.refreshUsers();
+            this.refreshChannels();
+            this.onlineUserSubscribe();
+          },
+          () => {
+            this.connectionErrorMessage = 'CONNECTION ERROR';
+            this.showApp = true;
+          }
+        );
       },
       refreshUsers() {
         axios.get('http://localhost:8080/users')
         .then(response => {
-          this.userLoadErrorMessage = '';
           const userListFromResponse = response.data
           .filter(user => user.username !== this.username)
           .map(user => user.username);
           this.userList = userListFromResponse;
-        })
-        .catch(() => {
-          this.userLoadErrorMessage = 'Failed to load user list';
         });
       },
       refreshChannels() {
         axios.get('http://localhost:8080/channels')
           .then(response => {
-            this.channelLoadErrorMessage = ''
             this.channelList = response.data;
-          })
-          .catch(() => {
-            this.channelLoadErrorMessage = 'Failed to load channel list'
-          });
-      },
-      handleCameraClick() {
-        this.localStream
-        .getVideoTracks()
-        .forEach((track) => track.enabled =! track.enabled);
-      },
-      async setVideoStream() {
-        await navigator.mediaDevices
-        .getUserMedia({
-          video: true,
-          audio: true
-        })
-        .then((stream) => {
-          this.$refs.localVideo.srcObject = stream;
-          this.localStream = stream;
-          this.localStream
-          .getVideoTracks()
-          .forEach((track) => track.enabled =! track.enabled);
-        })
-      },
-      joinVideoChannel() {
-        this.videoOn = true;
-        
-        this.setVideoStream().then(() => {
-          if (this.currentChannelId) {
-          const videoSubscription = this.stompClient.subscribe('/topic/channels/' + this.currentChannelId + '/video', res => {
-            const username = JSON.parse(res.body).username;
-            if (this.username !== username) {
-              console.log("========요청 받음========");
-              this.sendOffer(username);
-            }
-          });
-
-          const offerSubscription = this.stompClient.subscribe('/topic/offer/' + this.username, res => {
-            const response = JSON.parse(res.body);
-            console.log("========offer 받음========");
-            this.sendAnswer(response.sender);
-            this.handleSignal(response.signal);
-          });
-
-          const answerSubscription = this.stompClient.subscribe('/topic/answer/' + this.username, res => {
-            const response = JSON.parse(res.body);
-            console.log("========answer 받음========");
-            this.handleSignal(response.signal);
-          });
-
-          // 비디오 채널 입장
-          this.stompClient.send("/app/channels/" + this.currentChannelId + '/video/entrance', JSON.stringify({
-            username: this.username
-          }), {});
-
-          this.videoSubscriptionId = videoSubscription.id;
-          this.offerSusbcriptionId = offerSubscription.id;
-          this.answerSusbcriptionId = answerSubscription.id;
-        }
-        })
-      },
-      leaveVideoChannel() {
-        if (this.peer) {
-          this.peer.destroy();
-          this.peer = null;
-        }
-
-        if (this.localStream) {
-          this.localStream.getTracks().forEach(track => track.stop());
-          this.localStream = null;
-        }
-
-        if (this.remoteStream) {
-          this.remoteStream.getTracks().forEach(track => track.stop());
-          this.remoteStream = null;
-        }
-
-        if (this.videoSubscriptionId) {
-          this.stompClient.unsubscribe(this.videoSubscriptionId);
-          this.videoSubscriptionId = null;
-        }
-        if (this.offerSubscriptionId) {
-          this.stompClient.unsubscribe(this.offerSubscriptionId);
-          this.offerSubscriptionId = null;
-        }
-        if (this.answerSubscriptionId) {
-          this.stompClient.unsubscribe(this.answerSubscriptionId);
-          this.answerSubscriptionId = null;
-        }
-
-        if (this.$refs.localVideo) {
-         this.$refs.localVideo.srcObject = null;
-        }
-        if (this.$refs.remoteVideo) {
-          this.$refs.remoteVideo.srcObject = null;
-        }
-        this.videoOn = false;
-      },
-      sendOffer(username) {
-        this.peer = new Peer({
-          initiator: true,
-          trickle: true,
-          stream: this.localStream
-        });
-
-        this.peer.on("signal", (data) => {
-          this.stompClient.send('/app/offer', JSON.stringify({
-            sender: this.username,
-            receiver: username,
-            signal: data
-          }))
-          console.log("========offer 전송========");
-        });
-
-        this.peer.on("stream", (stream) => {
-          this.$refs.remoteVideo.srcObject = stream;
-          this.remoteStream = stream;
-
-          console.log("========stream 수신========");
-        });
-
-        this.peer.on("error", (err) => {
-          console.log("error", err);
-        });
-
-        this.peer.on("close", () => {
-          console.log("----------close--------");
-          this.peer = null;
         });
       },
-      sendAnswer(username) {
-        console.log("sendAnswer called for:", username);
-        console.log("Local stream:", this.localStream);
-        this.peer = new Peer({
-          initiator: false,
-          trickle: true,
-          stream: this.localStream
-        });
-
-        this.peer.on("signal", (data) => {
-          this.stompClient.send('/app/answer', JSON.stringify({
-            sender: this.username,
-            receiver: username,
-            signal: data
-          }))
-          console.log("========answer 전송========");
-        });
-
-        this.peer.on("stream", (stream) => {
-          this.$refs.remoteVideo.srcObject = stream;
-          this.remoteStream = stream;
-
-          console.log("========stream 수신========");
-        });
-
-        this.peer.on("error", (err) => {
-          console.log("error", err);
-        });
-
-        this.peer.on("close", () => {
-          console.log("----------close--------");
-          this.peer = null;
+      onlineUserSubscribe() {
+        this.stompClient.subscribe("/topic/users", res => {
+          const message = JSON.parse(res.body);
+          if (message.eventType === "CONNECT") {
+            this.userList.push(message.username);
+          }
+          else {
+            this.userList = this.userList.filter(username => username != message.username);
+          }
         });
       },
-      handleSignal(signalData) {
-        console.log("Handling signal data:", signalData);
-      try {
-        this.peer.signal(signalData);
-      } catch (err) {
-        console.error("Error signaling peer:", err);
-      }
-      },
-      subscribeToChannel(channelId) {
+      subscribeChannel(channelId) {
         if (this.currentChannelId) {
           this.stompClient.unsubscribe(this.textSubscriptionId);
-          this.stompClient.unsubscribe(this.videoSubscriptionId);
+          // this.stompClient.unsubscribe(this.videoSubscriptionId);
           this.messageList = [];
         }
 
@@ -311,40 +287,14 @@
         this.currentChannelId = channelId;
         this.textSubscriptionId = subscription.id;
       },
-      connect() {
-        const serverURL = "http://localhost:8080/ws";
-        let socket = new SockJS(serverURL);
-        this.stompClient = Stomp.over(socket);
-
-        const headers = {
-          username: this.username,
+      sendMessage() {
+        if (this.content.trim() !== '') {
+          this.stompClient.send("/app/channels/" + this.currentChannelId + '/text/messages', JSON.stringify({
+            username: this.username,
+            content: this.content
+          }), {});
         }
-
-        // 서버에 웹소켓 연결 요청
-        this.stompClient.connect(headers, 
-          () => {
-            this.connected = true;
-            this.showApp = false;
-            this.refreshUsers();
-            this.refreshChannels();
-
-            // 온라인 상태인 사용자 정보 구독
-            this.stompClient.subscribe("/topic/users", res => {
-              const message = JSON.parse(res.body);
-              if (message.eventType === "CONNECT") {
-                this.userList.push(message.username);
-              }
-              else {
-                this.userList = this.userList.filter(username => username != message.username);
-              }
-            });
-          },
-          () => {
-            this.connected = false;
-            this.connectionErrorMessage = 'CONNECTION ERROR';
-            this.showApp = true;
-          }
-        );
+          this.content = "";
       }
     }
   }
